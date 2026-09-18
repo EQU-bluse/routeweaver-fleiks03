@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RouteWeaver Dispatch</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">LOCAL DISPATCH CONTROL</p>
+        <h1>RouteWeaver</h1>
+        <p>Orders, available capacity, and an explainable dispatch draft.</p>
+      </header>
+      <section class="metrics" id="metrics"></section>
+      <section class="panel">
+        <div class="panel-title">
+          <div><p class="eyebrow">PLANNING QUEUE</p><h2>Open orders</h2></div>
+          <button id="plan">Build dispatch plan</button>
+        </div>
+        <div id="orders" class="grid"></div>
+      </section>
+      <section class="panel" id="plan-output" hidden>
+        <p class="eyebrow">EXPLAINABLE RESULT</p>
+        <pre id="plan-json"></pre>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

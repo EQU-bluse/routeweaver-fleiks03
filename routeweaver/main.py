@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from .db import connect, initialize, transaction
+from .models import DispatchPlan, Order, OrderCreate, Vehicle
+from .services import build_dispatch_plan
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    initialize()
+    yield
+
+
+app = FastAPI(title="RouteWeaver", version="0.1.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "routeweaver"}
+
+
+@app.get("/api/orders", response_model=list[Order])
+def list_orders() -> list[dict]:
+    with connect() as connection:
+        return [dict(row) for row in connection.execute("SELECT * FROM orders ORDER BY due_at, id")]
+
+
+@app.post("/api/orders", response_model=Order, status_code=201)
+def create_order(payload: OrderCreate) -> dict:
+    created_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO orders(reference, origin, destination, weight_kg, due_at, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                (
+                    payload.reference,
+                    payload.origin,
+                    payload.destination,
+                    payload.weight_kg,
+                    payload.due_at.isoformat(),
+                    created_at,
+                ),
+            )
+            row = connection.execute("SELECT * FROM orders WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    except Exception as error:
+        if "UNIQUE constraint failed" in str(error):
+            raise HTTPException(status_code=409, detail="order reference already exists") from error
+        raise
+    return dict(row)
+
+
+@app.get("/api/vehicles", response_model=list[Vehicle])
+def list_vehicles() -> list[dict]:
+    with connect() as connection:
+        return [dict(row) for row in connection.execute("SELECT * FROM vehicles ORDER BY id")]
+
+
+@app.post("/api/dispatch/plan", response_model=DispatchPlan)
+def plan_dispatch() -> DispatchPlan:
+    with connect() as connection:
+        return build_dispatch_plan(connection)
+
