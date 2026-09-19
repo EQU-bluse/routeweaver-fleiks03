@@ -83,7 +83,7 @@ def test_plan_remains_read_only(tmp_path, monkeypatch):
         response = client.post("/api/dispatch/plan")
         assert response.status_code == 200
         plan = response.json()
-        assert set(plan) == {"generated_at", "assignments", "unassigned_order_ids"}
+        assert set(plan) == {"generated_at", "assignments", "unassigned_order_ids", "unassigned_reasons"}
         assert len(plan["assignments"]) == 1
 
         # Nothing changed: no batches, order still pending, vehicle still available.
@@ -105,7 +105,13 @@ def test_commit_confirms_plan_and_flips_status(tmp_path, monkeypatch):
         response = client.post("/api/dispatch/commit")
         assert response.status_code == 200
         result = response.json()
-        assert set(result) == {"batch_id", "created_at", "assignments", "unassigned_order_ids"}
+        assert set(result) == {
+            "batch_id",
+            "created_at",
+            "assignments",
+            "unassigned_order_ids",
+            "unassigned_reasons",
+        }
         assert result["batch_id"] == 1
         assert result["created_at"]
 
@@ -296,3 +302,166 @@ def test_concurrent_commits_never_double_confirm(tmp_path, monkeypatch):
         assert vehicles["VAN-01"] == "assigned"
         assert vehicles["TRUCK-07"] == "assigned"
 
+
+
+def test_order_with_required_license_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        payload = _order_payload("RW-LIC-001", 500, 4)
+        payload["required_license"] = "H2"
+        response = client.post("/api/orders", json=payload)
+        assert response.status_code == 201
+        assert response.json()["required_license"] == "H2"
+
+        # Omitting the field (or null) stays null and is returned as such.
+        plain = _create_order(client, "RW-LIC-002", 100)
+        assert plain["required_license"] is None
+        payload_null = _order_payload("RW-LIC-003", 100, 4)
+        payload_null["required_license"] = None
+        assert client.post("/api/orders", json=payload_null).status_code == 201
+
+        orders = {order["reference"]: order for order in client.get("/api/orders").json()}
+        assert orders["RW-LIC-001"]["required_license"] == "H2"
+        assert orders["RW-LIC-002"]["required_license"] is None
+
+
+def test_order_required_license_validation(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        too_long = _order_payload("RW-LIC-LONG", 100, 4)
+        too_long["required_license"] = "X" * 33
+        assert client.post("/api/orders", json=too_long).status_code == 422
+
+        empty = _order_payload("RW-LIC-EMPTY", 100, 4)
+        empty["required_license"] = ""
+        assert client.post("/api/orders", json=empty).status_code == 422
+
+        ok = _order_payload("RW-LIC-MAX", 100, 4)
+        ok["required_license"] = "X" * 32
+        assert client.post("/api/orders", json=ok).status_code == 201
+
+
+def test_create_vehicle_and_list_with_driver_and_licenses(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/vehicles",
+            json={
+                "code": "VAN-99",
+                "capacity_kg": 1500,
+                "driver_name": "Rio Chen",
+                "licenses": ["C1", "H2", "C1"],
+            },
+        )
+        assert response.status_code == 201
+        created = response.json()
+        assert created["code"] == "VAN-99"
+        assert created["driver_name"] == "Rio Chen"
+        assert created["licenses"] == ["C1", "H2"]
+        assert created["status"] == "available"
+
+        vehicles = client.get("/api/vehicles").json()
+        assert [vehicle["code"] for vehicle in vehicles] == ["VAN-01", "TRUCK-07", "TRUCK-12", "VAN-99"]
+        by_code = {vehicle["code"]: vehicle for vehicle in vehicles}
+        assert by_code["VAN-99"]["driver_name"] == "Rio Chen"
+        assert by_code["VAN-99"]["licenses"] == ["C1", "H2"]
+
+        # Seeded demo vehicles carry driver and capability data too.
+        assert by_code["VAN-01"]["driver_name"]
+        assert by_code["TRUCK-07"]["licenses"] == ["C1", "H2"]
+
+        # Duplicate code conflicts; missing driver is rejected.
+        assert client.post(
+            "/api/vehicles",
+            json={"code": "VAN-99", "capacity_kg": 10, "driver_name": "Other", "licenses": []},
+        ).status_code == 409
+        assert client.post(
+            "/api/vehicles",
+            json={"code": "VAN-100", "capacity_kg": 10, "driver_name": "", "licenses": []},
+        ).status_code == 422
+
+
+def test_plan_respects_required_license(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        # Only TRUCK-07 holds H2 among available vehicles (VAN-01 has C1).
+        order = _create_order(client, "RW-HAZ-001", 500, due_hours=1)
+        payload = _order_payload("RW-HAZ-002", 500, 2)
+        payload["required_license"] = "H2"
+        licensed = client.post("/api/orders", json=payload).json()
+
+        plan = client.post("/api/dispatch/plan").json()
+        by_order = {item["order_id"]: item for item in plan["assignments"]}
+        assert by_order[order["id"]]["vehicle_code"] == "VAN-01"
+        assert by_order[licensed["id"]]["vehicle_code"] == "TRUCK-07"
+        assert plan["unassigned_order_ids"] == []
+        assert plan["unassigned_reasons"] == {}
+
+
+def test_unassigned_reasons_for_license_and_capacity(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        # No available vehicle carries license "CRANE".
+        payload = _order_payload("RW-NOLIC-001", 100, 1)
+        payload["required_license"] = "CRANE"
+        no_license = client.post("/api/orders", json=payload).json()
+        # Far heavier than any available vehicle.
+        heavy = _create_order(client, "RW-TOOHEAVY-001", 90_000, due_hours=2)
+
+        plan = client.post("/api/dispatch/plan").json()
+        assert plan["assignments"] == []
+        assert plan["unassigned_order_ids"] == [no_license["id"], heavy["id"]]
+        reasons = plan["unassigned_reasons"]
+        assert "license" in reasons[str(no_license["id"])].lower()
+        assert "CRANE" in reasons[str(no_license["id"])]
+        assert "capacity" in reasons[str(heavy["id"])].lower()
+
+        # Zero feasible assignments: commit is a 409 and persists nothing.
+        assert client.post("/api/dispatch/commit").status_code == 409
+        assert client.get("/api/dispatch/batches").json() == []
+        assert all(
+            order["status"] == "pending" for order in client.get("/api/orders").json()
+        )
+
+
+def test_commit_persists_unassigned_reasons_across_restart(tmp_path, monkeypatch):
+    db_file = _db_file(tmp_path)
+    monkeypatch.setenv("ROUTEWEAVER_DB", db_file)
+    with TestClient(app) as client:
+        ok = _create_order(client, "RW-MIX-001", 900, due_hours=1)
+        payload = _order_payload("RW-MIX-002", 100, 2)
+        payload["required_license"] = "CRANE"
+        blocked = client.post("/api/orders", json=payload).json()
+
+        response = client.post("/api/dispatch/commit")
+        assert response.status_code == 200
+        result = response.json()
+        assert [item["order_id"] for item in result["assignments"]] == [ok["id"]]
+        assert result["unassigned_order_ids"] == [blocked["id"]]
+        assert "license" in result["unassigned_reasons"][str(blocked["id"])].lower()
+
+        assert client.get("/api/dispatch/batches/1").json() == result
+
+    # After a restart the batch detail returns the same reasons verbatim.
+    with TestClient(app) as client:
+        detail = client.get("/api/dispatch/batches/1").json()
+        assert detail["unassigned_order_ids"] == [blocked["id"]]
+        assert detail["unassigned_reasons"] == result["unassigned_reasons"]
+
+
+def test_license_mismatch_only_yields_409_without_writes(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        payload = _order_payload("RW-ONLY-LIC-001", 100, 1)
+        payload["required_license"] = "CRANE"
+        client.post("/api/orders", json=payload)
+
+        response = client.post("/api/dispatch/commit")
+        assert response.status_code == 409
+        assert client.get("/api/dispatch/batches").json() == []
+        assert client.get("/api/orders").json()[0]["status"] == "pending"
+        assert all(
+            vehicle["status"] == "available"
+            for vehicle in client.get("/api/vehicles").json()
+            if vehicle["code"] in ("VAN-01", "TRUCK-07")
+        )

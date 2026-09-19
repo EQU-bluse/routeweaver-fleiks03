@@ -26,25 +26,50 @@ def _compute_plan(connection: sqlite3.Connection, generated_at: datetime) -> Dis
     vehicles = connection.execute(
         "SELECT * FROM vehicles WHERE status = 'available' ORDER BY capacity_kg, id"
     ).fetchall()
+    vehicle_licenses: dict[int, set[str]] = {vehicle["id"]: set() for vehicle in vehicles}
+    for row in connection.execute(
+        "SELECT vehicle_id, license_code FROM vehicle_licenses"
+    ):
+        if row["vehicle_id"] in vehicle_licenses:
+            vehicle_licenses[row["vehicle_id"]].add(row["license_code"])
 
     remaining = {vehicle["id"]: float(vehicle["capacity_kg"]) for vehicle in vehicles}
     assignments: list[DispatchAssignment] = []
     unassigned: list[int] = []
+    unassigned_reasons: dict[int, str] = {}
 
     for order in orders:
-        candidates = [
-            vehicle
-            for vehicle in vehicles
-            if remaining[vehicle["id"]] >= float(order["weight_kg"])
+        weight = float(order["weight_kg"])
+        required_license = order["required_license"]
+        capacity_ok = [
+            vehicle for vehicle in vehicles if remaining[vehicle["id"]] >= weight
         ]
+        if required_license is None:
+            candidates = capacity_ok
+        else:
+            candidates = [
+                vehicle
+                for vehicle in capacity_ok
+                if required_license in vehicle_licenses[vehicle["id"]]
+            ]
         if not candidates:
             unassigned.append(order["id"])
+            if not capacity_ok:
+                unassigned_reasons[order["id"]] = (
+                    f"no available vehicle with enough remaining capacity "
+                    f"for {weight:g} kg"
+                )
+            else:
+                unassigned_reasons[order["id"]] = (
+                    f"no available vehicle carries required license "
+                    f"'{required_license}'"
+                )
             continue
         vehicle = min(
             candidates,
-            key=lambda item: (remaining[item["id"]] - float(order["weight_kg"]), item["id"]),
+            key=lambda item: (remaining[item["id"]] - weight, item["id"]),
         )
-        remaining[vehicle["id"]] -= float(order["weight_kg"])
+        remaining[vehicle["id"]] -= weight
         assignments.append(
             DispatchAssignment(
                 order_id=order["id"],
@@ -61,6 +86,7 @@ def _compute_plan(connection: sqlite3.Connection, generated_at: datetime) -> Dis
         generated_at=generated_at,
         assignments=assignments,
         unassigned_order_ids=unassigned,
+        unassigned_reasons=unassigned_reasons,
     )
 
 
@@ -109,9 +135,15 @@ def commit_dispatch() -> dict[str, Any]:
             ],
         )
         connection.executemany(
-            "INSERT INTO dispatch_unassigned(batch_id, order_id, position) VALUES (?, ?, ?)",
+            "INSERT INTO dispatch_unassigned(batch_id, order_id, position, reason) "
+            "VALUES (?, ?, ?, ?)",
             [
-                (batch_id, order_id, position)
+                (
+                    batch_id,
+                    order_id,
+                    position,
+                    plan.unassigned_reasons.get(order_id, ""),
+                )
                 for position, order_id in enumerate(plan.unassigned_order_ids)
             ],
         )
@@ -146,6 +178,7 @@ def commit_dispatch() -> dict[str, Any]:
         "created_at": created_at,
         "assignments": [assignment.model_dump() for assignment in plan.assignments],
         "unassigned_order_ids": plan.unassigned_order_ids,
+        "unassigned_reasons": plan.unassigned_reasons,
     }
 
 
@@ -192,17 +225,17 @@ def get_batch(connection: sqlite3.Connection, batch_id: int) -> dict[str, Any] |
             (batch_id,),
         )
     ]
-    unassigned_order_ids = [
-        row["order_id"]
-        for row in connection.execute(
-            "SELECT order_id FROM dispatch_unassigned WHERE batch_id = ? ORDER BY position",
-            (batch_id,),
-        )
-    ]
+    unassigned_rows = connection.execute(
+        "SELECT order_id, reason FROM dispatch_unassigned WHERE batch_id = ? ORDER BY position",
+        (batch_id,),
+    ).fetchall()
+    unassigned_order_ids = [row["order_id"] for row in unassigned_rows]
+    unassigned_reasons = {row["order_id"]: row["reason"] for row in unassigned_rows}
 
     return {
         "batch_id": batch["id"],
         "created_at": batch["created_at"],
         "assignments": assignments,
         "unassigned_order_ids": unassigned_order_ids,
+        "unassigned_reasons": unassigned_reasons,
     }
