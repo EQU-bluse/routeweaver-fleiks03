@@ -17,13 +17,23 @@
       <section class="panel">
         <div class="panel-title">
           <div><p class="eyebrow">PLANNING QUEUE</p><h2>Open orders</h2></div>
-          <button id="plan">Build dispatch plan</button>
+          <div class="actions">
+            <button id="plan">Build dispatch plan</button>
+            <button id="commit" class="primary">Confirm dispatch</button>
+          </div>
         </div>
         <div id="orders" class="grid"></div>
       </section>
       <section class="panel" id="plan-output" hidden>
         <p class="eyebrow">EXPLAINABLE RESULT</p>
         <pre id="plan-json"></pre>
+      </section>
+      <section class="panel">
+        <div class="panel-title">
+          <div><p class="eyebrow">CONFIRMED HISTORY</p><h2>Dispatch batches</h2></div>
+          <button id="refresh-batches">Refresh</button>
+        </div>
+        <div id="batches" class="grid"></div>
       </section>
     </main>
     <script src="/static/app.js"></script>

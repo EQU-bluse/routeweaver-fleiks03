@@ -1,10 +1,33 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import threading
 
 from fastapi.testclient import TestClient
 
+from routeweaver.db import connect
 from routeweaver.main import app
+
+
+def _db_file(tmp_path) -> str:
+    return str(tmp_path / "routeweaver.db")
+
+
+def _order_payload(reference: str, weight_kg: float, due_hours: float) -> dict:
+    return {
+        "reference": reference,
+        "origin": "Alpha Hub",
+        "destination": "Beta Store",
+        "weight_kg": weight_kg,
+        "due_at": (datetime.now(timezone.utc) + timedelta(hours=due_hours)).isoformat(),
+    }
+
+
+def _create_order(client, reference: str, weight_kg: float, due_hours: float = 4) -> dict:
+    response = client.post("/api/orders", json=_order_payload(reference, weight_kg, due_hours))
+    assert response.status_code == 201
+    return response.json()
 
 
 def test_health_and_seeded_vehicles(tmp_path, monkeypatch):
@@ -48,4 +71,228 @@ def test_duplicate_reference_is_rejected(tmp_path, monkeypatch):
     with TestClient(app) as client:
         assert client.post("/api/orders", json=payload).status_code == 201
         assert client.post("/api/orders", json=payload).status_code == 409
+
+
+def test_plan_remains_read_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        _create_order(client, "RW-PREVIEW-001", 900)
+        before_orders = client.get("/api/orders").json()
+        before_vehicles = client.get("/api/vehicles").json()
+
+        response = client.post("/api/dispatch/plan")
+        assert response.status_code == 200
+        plan = response.json()
+        assert set(plan) == {"generated_at", "assignments", "unassigned_order_ids"}
+        assert len(plan["assignments"]) == 1
+
+        # Nothing changed: no batches, order still pending, vehicle still available.
+        assert client.get("/api/dispatch/batches").json() == []
+        assert client.get("/api/orders").json() == before_orders
+        assert client.get("/api/vehicles").json() == before_vehicles
+
+
+def test_commit_confirms_plan_and_flips_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        first = _create_order(client, "RW-COMMIT-001", 850, due_hours=1)
+        second = _create_order(client, "RW-COMMIT-002", 7_000, due_hours=2)
+        third = _create_order(client, "RW-COMMIT-003", 300, due_hours=3)
+        heavy = _create_order(client, "RW-COMMIT-004", 2_000, due_hours=4)
+
+        preview = client.post("/api/dispatch/plan").json()
+
+        response = client.post("/api/dispatch/commit")
+        assert response.status_code == 200
+        result = response.json()
+        assert set(result) == {"batch_id", "created_at", "assignments", "unassigned_order_ids"}
+        assert result["batch_id"] == 1
+        assert result["created_at"]
+
+        # Commit recomputes the exact same deterministic rule as the preview.
+        preview_assignments = [
+            {key: item[key] for key in ("order_id", "vehicle_id", "vehicle_code", "reason")}
+            for item in preview["assignments"]
+        ]
+        assert result["assignments"] == preview_assignments
+        assert [item["order_id"] for item in result["assignments"]] == [
+            first["id"],
+            second["id"],
+            third["id"],
+        ]
+        assert [item["vehicle_code"] for item in result["assignments"]] == [
+            "VAN-01",
+            "TRUCK-07",
+            "VAN-01",
+        ]
+        assert all("fits" in item["reason"] for item in result["assignments"])
+        assert result["unassigned_order_ids"] == [heavy["id"]]
+
+        # Orders and vehicles transition exactly as specified.
+        statuses = {order["id"]: order["status"] for order in client.get("/api/orders").json()}
+        assert statuses[first["id"]] == "planned"
+        assert statuses[second["id"]] == "planned"
+        assert statuses[third["id"]] == "planned"
+        assert statuses[heavy["id"]] == "pending"
+        vehicles = {vehicle["code"]: vehicle["status"] for vehicle in client.get("/api/vehicles").json()}
+        assert vehicles["VAN-01"] == "assigned"
+        assert vehicles["TRUCK-07"] == "assigned"
+        assert vehicles["TRUCK-12"] == "maintenance"
+
+        # Summary and detail endpoints agree.
+        summaries = client.get("/api/dispatch/batches").json()
+        assert summaries == [
+            {
+                "batch_id": 1,
+                "created_at": result["created_at"],
+                "assignment_count": 3,
+                "unassigned_count": 1,
+            }
+        ]
+        assert client.get("/api/dispatch/batches/1").json() == result
+
+
+def test_commit_then_new_orders_creates_second_batch_in_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        first_order = _create_order(client, "RW-BATCH-A", 900)
+        first = client.post("/api/dispatch/commit").json()
+        assert first["batch_id"] == 1
+
+        # After the first batch only TRUCK-07 is available, so the next order lands there.
+        second_order = _create_order(client, "RW-BATCH-B", 2_000)
+        second = client.post("/api/dispatch/commit").json()
+        assert second["batch_id"] == 2
+        assert second["assignments"][0]["order_id"] == second_order["id"]
+        assert second["assignments"][0]["vehicle_code"] == "TRUCK-07"
+        assert all(item["order_id"] != first_order["id"] for item in second["assignments"])
+
+        summaries = client.get("/api/dispatch/batches").json()
+        assert [batch["batch_id"] for batch in summaries] == [1, 2]
+
+
+def test_commit_409_without_pending_orders_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        _create_order(client, "RW-EMPTY-001", 900)
+        assert client.post("/api/dispatch/commit").status_code == 200
+
+        response = client.post("/api/dispatch/commit")
+        assert response.status_code == 409
+
+        # Exactly one batch still exists; the failed commit added no empty batch.
+        summaries = client.get("/api/dispatch/batches").json()
+        assert len(summaries) == 1
+        assert summaries[0]["assignment_count"] == 1
+        assert summaries[0]["unassigned_count"] == 0
+
+
+def test_commit_409_without_available_vehicles_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        _create_order(client, "RW-USED-001", 5_000, due_hours=1)
+        _create_order(client, "RW-USED-002", 900, due_hours=2)
+        assert client.post("/api/dispatch/commit").status_code == 200
+
+        pending = _create_order(client, "RW-USED-003", 100, due_hours=3)
+        response = client.post("/api/dispatch/commit")
+        assert response.status_code == 409
+
+        # No new batch, the new order stays pending, and vehicles stay assigned.
+        assert [batch["batch_id"] for batch in client.get("/api/dispatch/batches").json()] == [1]
+        order = next(o for o in client.get("/api/orders").json() if o["id"] == pending["id"])
+        assert order["status"] == "pending"
+        assert all(
+            vehicle["status"] == "assigned"
+            for vehicle in client.get("/api/vehicles").json()
+            if vehicle["code"] in ("VAN-01", "TRUCK-07")
+        )
+
+
+def test_commit_409_when_nothing_fits_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        _create_order(client, "RW-HEAVY-001", 50_000)
+        response = client.post("/api/dispatch/commit")
+        assert response.status_code == 409
+
+        assert client.get("/api/dispatch/batches").json() == []
+        assert client.get("/api/orders").json()[0]["status"] == "pending"
+        assert all(
+            vehicle["status"] == "available"
+            for vehicle in client.get("/api/vehicles").json()
+            if vehicle["code"] in ("VAN-01", "TRUCK-07")
+        )
+
+
+def test_unknown_batch_returns_404(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        assert client.get("/api/dispatch/batches/999").status_code == 404
+
+
+def test_batch_survives_service_restart(tmp_path, monkeypatch):
+    db_file = _db_file(tmp_path)
+    monkeypatch.setenv("ROUTEWEAVER_DB", db_file)
+    with TestClient(app) as client:
+        _create_order(client, "RW-RESTART-001", 900, due_hours=1)
+        _create_order(client, "RW-RESTART-002", 60_000, due_hours=2)
+        committed = client.post("/api/dispatch/commit").json()
+
+    # Simulate a restart against the same on-disk SQLite database.
+    with TestClient(app) as client:
+        summaries = client.get("/api/dispatch/batches").json()
+        assert [batch["batch_id"] for batch in summaries] == [1]
+        assert client.get("/api/dispatch/batches/1").json() == committed
+
+        with connect(Path(db_file)) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM dispatch_batches").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM dispatch_assignments").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM dispatch_unassigned").fetchone()[0] == 1
+
+
+def test_concurrent_commits_never_double_confirm(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        order_a = _create_order(client, "RW-RACE-001", 900, due_hours=1)
+        order_b = _create_order(client, "RW-RACE-002", 2_000, due_hours=2)
+
+        results: list[tuple[int, object]] = []
+        errors: list[Exception] = []
+        barrier = threading.Barrier(4)
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                response = client.post("/api/dispatch/commit")
+                body = response.json() if response.content else None
+                results.append((response.status_code, body))
+            except Exception as error:  # pragma: no cover - surfaced via assertions below
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert sorted(status for status, _ in results) == [200, 409, 409, 409]
+        success = next(body for status, body in results if status == 200)
+        assert sorted(item["order_id"] for item in success["assignments"]) == [
+            order_a["id"],
+            order_b["id"],
+        ]
+
+        # Exactly one batch; no order or vehicle is confirmed twice.
+        assert len(client.get("/api/dispatch/batches").json()) == 1
+        detail = client.get("/api/dispatch/batches/1").json()
+        order_ids = [item["order_id"] for item in detail["assignments"]]
+        vehicle_ids = [item["vehicle_id"] for item in detail["assignments"]]
+        assert len(order_ids) == len(set(order_ids)) == 2
+        assert len(vehicle_ids) == len(set(vehicle_ids))
+        assert all(order["status"] == "planned" for order in client.get("/api/orders").json())
+        vehicles = {vehicle["code"]: vehicle["status"] for vehicle in client.get("/api/vehicles").json()}
+        assert vehicles["VAN-01"] == "assigned"
+        assert vehicles["TRUCK-07"] == "assigned"
 

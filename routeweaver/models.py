@@ -39,3 +39,17 @@ class DispatchPlan(BaseModel):
     assignments: list[DispatchAssignment]
     unassigned_order_ids: list[int]
 
+
+class DispatchBatchSummary(BaseModel):
+    batch_id: int
+    created_at: datetime
+    assignment_count: int
+    unassigned_count: int
+
+
+class DispatchBatchResult(BaseModel):
+    batch_id: int
+    created_at: datetime
+    assignments: list[DispatchAssignment]
+    unassigned_order_ids: list[int]
+

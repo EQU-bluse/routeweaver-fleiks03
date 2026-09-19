@@ -13,8 +13,13 @@ h2 { margin: .2rem 0 0; }
 .metrics strong { font-size: 2rem; }
 .panel { margin-top: 1rem; padding: 1.4rem; }
 .panel-title { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.2rem; }
+.actions { display: flex; gap: .6rem; flex-wrap: wrap; }
 button { border: 0; border-radius: 999px; padding: .8rem 1.1rem; background: #70e6a7; color: #07100e; font-weight: 800; cursor: pointer; }
+button.primary { background: #2f9e68; color: #eef8f3; }
+button:disabled { opacity: .55; cursor: default; }
 .order { display: flex; flex-direction: column; gap: .4rem; padding: 1rem; background: #0d241c; border-radius: 12px; }
+.batch { display: flex; flex-direction: column; gap: .35rem; padding: 1rem; background: #0d241c; border-radius: 12px; cursor: pointer; }
+.batch:hover { outline: 1px solid #70e6a7; }
 pre { overflow: auto; color: #c8f9dd; }
 .empty { color: #99b8ac; }
 

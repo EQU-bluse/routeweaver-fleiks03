@@ -24,6 +24,25 @@ CREATE TABLE IF NOT EXISTS vehicles (
     capacity_kg REAL NOT NULL CHECK (capacity_kg > 0),
     status TEXT NOT NULL DEFAULT 'available'
 );
+CREATE TABLE IF NOT EXISTS dispatch_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispatch_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES dispatch_batches(id),
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),
+    vehicle_code TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispatch_unassigned (
+    batch_id INTEGER NOT NULL REFERENCES dispatch_batches(id),
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    position INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, order_id)
+);
 """
 
 SEED_VEHICLES = (

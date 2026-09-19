@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from typing import Any
 
+from .db import transaction
 from .models import DispatchAssignment, DispatchPlan
 
 
-def build_dispatch_plan(connection: sqlite3.Connection) -> DispatchPlan:
+class NothingToCommitError(Exception):
+    """Raised when a commit would produce no confirmed assignments."""
+
+
+def _compute_plan(connection: sqlite3.Connection, generated_at: datetime) -> DispatchPlan:
+    """Apply the deterministic planning rule against the current database state.
+
+    Orders are processed by (due_at, id); each order goes onto the available
+    vehicle (ordered by capacity, id) whose remaining capacity leaves the
+    tightest fit. This function is read-only and is shared by the preview and
+    commit paths so both always agree.
+    """
     orders = connection.execute(
         "SELECT * FROM orders WHERE status = 'pending' ORDER BY due_at, id"
     ).fetchall()
@@ -45,8 +58,151 @@ def build_dispatch_plan(connection: sqlite3.Connection) -> DispatchPlan:
         )
 
     return DispatchPlan(
-        generated_at=datetime.now(timezone.utc),
+        generated_at=generated_at,
         assignments=assignments,
         unassigned_order_ids=unassigned,
     )
 
+
+def build_dispatch_plan(connection: sqlite3.Connection) -> DispatchPlan:
+    """Read-only deterministic preview; never mutates orders, vehicles or history."""
+    return _compute_plan(connection, datetime.now(timezone.utc))
+
+
+def commit_dispatch() -> dict[str, Any]:
+    """Recompute the plan and persist it as a confirmed batch atomically.
+
+    Returns the batch result. Raises NothingToCommitError when there is nothing
+    confirmable (no pending orders, no available vehicles, or no feasible
+    assignment); in that case the transaction is rolled back without creating a
+    batch or touching any status.
+    """
+    created_at = datetime.now(timezone.utc)
+    with transaction() as connection:
+        plan = _compute_plan(connection, created_at)
+
+        if not plan.assignments:
+            raise NothingToCommitError(
+                "no confirmable dispatch: pending orders or available vehicles missing"
+            )
+
+        cursor = connection.execute(
+            "INSERT INTO dispatch_batches(created_at) VALUES (?)",
+            (created_at.isoformat(),),
+        )
+        batch_id = cursor.lastrowid
+
+        connection.executemany(
+            """INSERT INTO dispatch_assignments(
+                   batch_id, order_id, vehicle_id, vehicle_code, reason, position
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    batch_id,
+                    assignment.order_id,
+                    assignment.vehicle_id,
+                    assignment.vehicle_code,
+                    assignment.reason,
+                    position,
+                )
+                for position, assignment in enumerate(plan.assignments)
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO dispatch_unassigned(batch_id, order_id, position) VALUES (?, ?, ?)",
+            [
+                (batch_id, order_id, position)
+                for position, order_id in enumerate(plan.unassigned_order_ids)
+            ],
+        )
+
+        assigned_order_ids = [assignment.order_id for assignment in plan.assignments]
+        assigned_vehicle_ids = list(
+            {assignment.vehicle_id for assignment in plan.assignments}
+        )
+
+        order_result = connection.execute(
+            f"UPDATE orders SET status = 'planned' "
+            f"WHERE id IN ({','.join('?' for _ in assigned_order_ids)}) AND status = 'pending'",
+            assigned_order_ids,
+        )
+        vehicle_result = connection.execute(
+            f"UPDATE vehicles SET status = 'assigned' "
+            f"WHERE id IN ({','.join('?' for _ in assigned_vehicle_ids)}) AND status = 'available'",
+            assigned_vehicle_ids,
+        )
+
+        # Defensive invariant: the plan was computed inside this same locked
+        # transaction, so every target row must still be in the expected state.
+        # A mismatch means a concurrent writer changed state mid-commit; refuse
+        # rather than double-confirming an order or vehicle.
+        if order_result.rowcount != len(assigned_order_ids):
+            raise NothingToCommitError("orders changed concurrently; no batch created")
+        if vehicle_result.rowcount != len(assigned_vehicle_ids):
+            raise NothingToCommitError("vehicles changed concurrently; no batch created")
+
+    return {
+        "batch_id": batch_id,
+        "created_at": created_at,
+        "assignments": [assignment.model_dump() for assignment in plan.assignments],
+        "unassigned_order_ids": plan.unassigned_order_ids,
+    }
+
+
+def list_batches(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Batch summaries ordered by creation time then batch id."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT b.id AS batch_id,
+                   b.created_at,
+                   COUNT(DISTINCT a.id) AS assignment_count,
+                   COUNT(DISTINCT u.order_id) AS unassigned_count
+            FROM dispatch_batches AS b
+            LEFT JOIN dispatch_assignments AS a ON a.batch_id = b.id
+            LEFT JOIN dispatch_unassigned AS u ON u.batch_id = b.id
+            GROUP BY b.id
+            ORDER BY b.created_at, b.id
+            """
+        )
+    ]
+
+
+def get_batch(connection: sqlite3.Connection, batch_id: int) -> dict[str, Any] | None:
+    """Full confirmed result for one batch, or None if it does not exist."""
+    batch = connection.execute(
+        "SELECT id, created_at FROM dispatch_batches WHERE id = ?", (batch_id,)
+    ).fetchone()
+    if batch is None:
+        return None
+
+    assignments = [
+        {
+            "order_id": row["order_id"],
+            "vehicle_id": row["vehicle_id"],
+            "vehicle_code": row["vehicle_code"],
+            "reason": row["reason"],
+        }
+        for row in connection.execute(
+            """SELECT order_id, vehicle_id, vehicle_code, reason
+               FROM dispatch_assignments
+               WHERE batch_id = ?
+               ORDER BY position, id""",
+            (batch_id,),
+        )
+    ]
+    unassigned_order_ids = [
+        row["order_id"]
+        for row in connection.execute(
+            "SELECT order_id FROM dispatch_unassigned WHERE batch_id = ? ORDER BY position",
+            (batch_id,),
+        )
+    ]
+
+    return {
+        "batch_id": batch["id"],
+        "created_at": batch["created_at"],
+        "assignments": assignments,
+        "unassigned_order_ids": unassigned_order_ids,
+    }
