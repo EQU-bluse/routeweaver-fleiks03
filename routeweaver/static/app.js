@@ -26,6 +26,18 @@ document.querySelector('#plan').addEventListener('click', async () => {
   document.querySelector('#plan-output').hidden = false;
 });
 
+document.querySelector('#commit').addEventListener('click', async () => {
+  const output = document.querySelector('#plan-json');
+  try {
+    const batch = await request('/api/dispatch/commit', { method: 'POST' });
+    output.textContent = JSON.stringify(batch, null, 2);
+  } catch (error) {
+    output.textContent = `Commit rejected: ${error.message}`;
+  }
+  document.querySelector('#plan-output').hidden = false;
+  await refresh();
+});
+
 refresh().catch((error) => {
   document.querySelector('#orders').textContent = error.message;
 });

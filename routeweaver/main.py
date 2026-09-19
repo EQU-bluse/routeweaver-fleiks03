@@ -9,8 +9,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import connect, initialize, transaction
-from .models import DispatchPlan, Order, OrderCreate, Vehicle
-from .services import build_dispatch_plan
+from .models import DispatchBatch, DispatchBatchSummary, DispatchPlan, Order, OrderCreate, Vehicle
+from .services import build_dispatch_plan, commit_dispatch_plan, get_dispatch_batch, list_dispatch_batches
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -76,4 +76,31 @@ def list_vehicles() -> list[dict]:
 def plan_dispatch() -> DispatchPlan:
     with connect() as connection:
         return build_dispatch_plan(connection)
+
+
+@app.post("/api/dispatch/commit", response_model=DispatchBatch, status_code=201)
+def commit_dispatch() -> DispatchBatch:
+    with transaction() as connection:
+        batch = commit_dispatch_plan(connection)
+        if batch is None:
+            raise HTTPException(
+                status_code=409,
+                detail="nothing to confirm: no pending orders or no available vehicle capacity",
+            )
+        return batch
+
+
+@app.get("/api/dispatch/batches", response_model=list[DispatchBatchSummary])
+def list_batches() -> list[DispatchBatchSummary]:
+    with connect() as connection:
+        return list_dispatch_batches(connection)
+
+
+@app.get("/api/dispatch/batches/{batch_id}", response_model=DispatchBatch)
+def get_batch(batch_id: int) -> DispatchBatch:
+    with connect() as connection:
+        batch = get_dispatch_batch(connection, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="dispatch batch not found")
+    return batch
 

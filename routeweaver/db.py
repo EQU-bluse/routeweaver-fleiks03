@@ -24,6 +24,19 @@ CREATE TABLE IF NOT EXISTS vehicles (
     capacity_kg REAL NOT NULL CHECK (capacity_kg > 0),
     status TEXT NOT NULL DEFAULT 'available'
 );
+CREATE TABLE IF NOT EXISTS dispatch_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    unassigned_order_ids TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS dispatch_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES dispatch_batches(id),
+    order_id INTEGER NOT NULL,
+    vehicle_id INTEGER NOT NULL,
+    vehicle_code TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
 """
 
 SEED_VEHICLES = (
@@ -41,6 +54,7 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     connection = sqlite3.connect(path or database_path())
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
     return connection
 
 
