@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS orders (
     destination TEXT NOT NULL,
     weight_kg REAL NOT NULL CHECK (weight_kg > 0),
     due_at TEXT NOT NULL,
+    required_license TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL
 );
@@ -22,7 +23,14 @@ CREATE TABLE IF NOT EXISTS vehicles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT NOT NULL UNIQUE,
     capacity_kg REAL NOT NULL CHECK (capacity_kg > 0),
+    driver_name TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'available'
+);
+CREATE TABLE IF NOT EXISTS vehicle_licenses (
+    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),
+    license_code TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (vehicle_id, license_code)
 );
 CREATE TABLE IF NOT EXISTS dispatch_batches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,15 +48,18 @@ CREATE TABLE IF NOT EXISTS dispatch_assignments (
 CREATE TABLE IF NOT EXISTS dispatch_unassigned (
     batch_id INTEGER NOT NULL REFERENCES dispatch_batches(id),
     order_id INTEGER NOT NULL REFERENCES orders(id),
+    reason TEXT NOT NULL DEFAULT '',
     position INTEGER NOT NULL,
     PRIMARY KEY (batch_id, order_id)
 );
 """
 
+# Demo vehicles and the driver/credentials behind each one. Licenses are stored
+# de-duplicated and ordered so capability checks are deterministic.
 SEED_VEHICLES = (
-    ("VAN-01", 1_200.0, "available"),
-    ("TRUCK-07", 8_000.0, "available"),
-    ("TRUCK-12", 18_000.0, "maintenance"),
+    ("VAN-01", 1_200.0, "available", "Avery Chen", ("C-CLASS",)),
+    ("TRUCK-07", 8_000.0, "available", "Morgan Diaz", ("C-CLASS", "HAZMAT")),
+    ("TRUCK-12", 18_000.0, "maintenance", "Riley Okafor", ("C-CLASS", "HAZMAT", "OVERSIZE")),
 )
 
 
@@ -63,13 +74,53 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     return connection
 
 
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Bring older databases forward without dropping any data."""
+    order_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(orders)")
+    }
+    if "required_license" not in order_columns:
+        connection.execute("ALTER TABLE orders ADD COLUMN required_license TEXT")
+
+    vehicle_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(vehicles)")
+    }
+    if "driver_name" not in vehicle_columns:
+        connection.execute("ALTER TABLE vehicles ADD COLUMN driver_name TEXT NOT NULL DEFAULT ''")
+
+    unassigned_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(dispatch_unassigned)")
+    }
+    if "reason" not in unassigned_columns:
+        connection.execute(
+            "ALTER TABLE dispatch_unassigned ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
+        )
+
+
 def initialize(path: Path | None = None) -> None:
     with connect(path) as connection:
         connection.executescript(SCHEMA)
-        connection.executemany(
-            "INSERT OR IGNORE INTO vehicles(code, capacity_kg, status) VALUES (?, ?, ?)",
-            SEED_VEHICLES,
-        )
+        _migrate(connection)
+        for code, capacity, status, driver_name, licenses in SEED_VEHICLES:
+            connection.execute(
+                """INSERT OR IGNORE INTO vehicles(code, capacity_kg, driver_name, status)
+                   VALUES (?, ?, ?, ?)""",
+                (code, capacity, driver_name, status),
+            )
+            vehicle_id = connection.execute(
+                "SELECT id FROM vehicles WHERE code = ?", (code,)
+            ).fetchone()["id"]
+            # Backfill capability data for databases seeded before drivers existed.
+            connection.execute(
+                "UPDATE vehicles SET driver_name = ? WHERE id = ? AND driver_name = ''",
+                (driver_name, vehicle_id),
+            )
+            for position, license_code in enumerate(licenses):
+                connection.execute(
+                    """INSERT OR IGNORE INTO vehicle_licenses(vehicle_id, license_code, position)
+                       VALUES (?, ?, ?)""",
+                    (vehicle_id, license_code, position),
+                )
 
 
 @contextmanager
@@ -84,4 +135,3 @@ def transaction(path: Path | None = None) -> Iterator[sqlite3.Connection]:
         raise
     finally:
         connection.close()
-

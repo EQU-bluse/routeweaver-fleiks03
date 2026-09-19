@@ -83,7 +83,12 @@ def test_plan_remains_read_only(tmp_path, monkeypatch):
         response = client.post("/api/dispatch/plan")
         assert response.status_code == 200
         plan = response.json()
-        assert set(plan) == {"generated_at", "assignments", "unassigned_order_ids"}
+        assert set(plan) == {
+            "generated_at",
+            "assignments",
+            "unassigned_order_ids",
+            "unassigned_reasons",
+        }
         assert len(plan["assignments"]) == 1
 
         # Nothing changed: no batches, order still pending, vehicle still available.
@@ -105,7 +110,13 @@ def test_commit_confirms_plan_and_flips_status(tmp_path, monkeypatch):
         response = client.post("/api/dispatch/commit")
         assert response.status_code == 200
         result = response.json()
-        assert set(result) == {"batch_id", "created_at", "assignments", "unassigned_order_ids"}
+        assert set(result) == {
+            "batch_id",
+            "created_at",
+            "assignments",
+            "unassigned_order_ids",
+            "unassigned_reasons",
+        }
         assert result["batch_id"] == 1
         assert result["created_at"]
 
@@ -127,6 +138,9 @@ def test_commit_confirms_plan_and_flips_status(tmp_path, monkeypatch):
         ]
         assert all("fits" in item["reason"] for item in result["assignments"])
         assert result["unassigned_order_ids"] == [heavy["id"]]
+        assert result["unassigned_reasons"] == {
+            str(heavy["id"]): "no available vehicle can carry 2000 kg"
+        }
 
         # Orders and vehicles transition exactly as specified.
         statuses = {order["id"]: order["status"] for order in client.get("/api/orders").json()}
@@ -251,6 +265,16 @@ def test_batch_survives_service_restart(tmp_path, monkeypatch):
             assert connection.execute("SELECT COUNT(*) FROM dispatch_unassigned").fetchone()[0] == 1
 
 
+def _create_order_with_license(
+    client, reference: str, weight_kg: float, required_license, due_hours: float = 4
+) -> dict:
+    payload = _order_payload(reference, weight_kg, due_hours)
+    payload["required_license"] = required_license
+    response = client.post("/api/orders", json=payload)
+    assert response.status_code == 201
+    return response.json()
+
+
 def test_concurrent_commits_never_double_confirm(tmp_path, monkeypatch):
     monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
     with TestClient(app) as client:
@@ -296,3 +320,174 @@ def test_concurrent_commits_never_double_confirm(tmp_path, monkeypatch):
         assert vehicles["VAN-01"] == "assigned"
         assert vehicles["TRUCK-07"] == "assigned"
 
+
+
+def test_seeded_vehicles_carry_driver_and_licenses(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        vehicles = client.get("/api/vehicles").json()
+        assert [vehicle["code"] for vehicle in vehicles] == ["VAN-01", "TRUCK-07", "TRUCK-12"]
+        assert set(vehicles[0]) == {"id", "code", "capacity_kg", "driver_name", "licenses", "status"}
+        by_code = {vehicle["code"]: vehicle for vehicle in vehicles}
+        assert by_code["VAN-01"]["driver_name"]
+        assert by_code["VAN-01"]["licenses"] == ["C-CLASS"]
+        assert by_code["TRUCK-07"]["licenses"] == ["C-CLASS", "HAZMAT"]
+        assert by_code["TRUCK-12"]["licenses"] == ["C-CLASS", "HAZMAT", "OVERSIZE"]
+        assert all(vehicle["driver_name"] for vehicle in vehicles)
+
+
+def test_order_required_license_round_trip_and_validation(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        plain = _create_order(client, "RW-LIC-000", 100)
+        assert plain["required_license"] is None
+
+        nulled = client.post(
+            "/api/orders",
+            json={**_order_payload("RW-LIC-001", 100, 4), "required_license": None},
+        )
+        assert nulled.status_code == 201
+        assert nulled.json()["required_license"] is None
+
+        hazmat = _create_order_with_license(client, "RW-LIC-002", 100, "HAZMAT")
+        assert hazmat["required_license"] == "HAZMAT"
+
+        fetched = next(o for o in client.get("/api/orders").json() if o["id"] == hazmat["id"])
+        assert fetched["required_license"] == "HAZMAT"
+
+        bad = client.post(
+            "/api/orders",
+            json={**_order_payload("RW-LIC-003", 100, 4), "required_license": ""},
+        )
+        assert bad.status_code == 422
+        long_code = {**_order_payload("RW-LIC-004", 100, 4), "required_license": "X" * 33}
+        assert client.post("/api/orders", json=long_code).status_code == 422
+
+
+def test_create_vehicle_with_deduped_licenses(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/vehicles",
+            json={
+                "code": "VAN-99",
+                "capacity_kg": 2_500,
+                "driver_name": "Sam Reyes",
+                "licenses": ["HAZMAT", "HAZMAT", "REFRIG", "HAZMAT"],
+            },
+        )
+        assert response.status_code == 201
+        created = response.json()
+        assert created["code"] == "VAN-99"
+        assert created["capacity_kg"] == 2_500
+        assert created["driver_name"] == "Sam Reyes"
+        assert created["licenses"] == ["HAZMAT", "REFRIG"]
+        assert created["status"] == "available"
+
+        listed = next(v for v in client.get("/api/vehicles").json() if v["code"] == "VAN-99")
+        assert listed["licenses"] == ["HAZMAT", "REFRIG"]
+
+        # Duplicate code conflicts.
+        dup = client.post(
+            "/api/vehicles",
+            json={"code": "VAN-99", "capacity_kg": 1, "driver_name": "Other"},
+        )
+        assert dup.status_code == 409
+
+        # Empty driver and invalid license codes are rejected.
+        assert (
+            client.post(
+                "/api/vehicles",
+                json={"code": "VAN-98", "capacity_kg": 1, "driver_name": "  "},
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/vehicles",
+                json={
+                    "code": "VAN-97",
+                    "capacity_kg": 1,
+                    "driver_name": "Pat",
+                    "licenses": [""],
+                },
+            ).status_code
+            == 422
+        )
+
+
+def test_required_license_routes_to_capable_vehicle(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        # 900 kg would normally fit VAN-01 tightest, but only TRUCK-07 has HAZMAT.
+        order = _create_order_with_license(client, "RW-HAZ-001", 900, "HAZMAT", due_hours=1)
+        plan = client.post("/api/dispatch/plan").json()
+        assert [item["order_id"] for item in plan["assignments"]] == [order["id"]]
+        assert plan["assignments"][0]["vehicle_code"] == "TRUCK-07"
+        assert plan["unassigned_order_ids"] == []
+        assert plan["unassigned_reasons"] == {}
+
+
+def test_unassigned_reasons_distinguish_capacity_and_license(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        heavy = _create_order(client, "RW-WHY-001", 50_000, due_hours=1)
+        # OVERSIZE only exists on TRUCK-12, which is in maintenance.
+        oversize = _create_order_with_license(client, "RW-WHY-002", 100, "OVERSIZE", due_hours=2)
+        light = _create_order(client, "RW-WHY-003", 100, due_hours=3)
+
+        plan = client.post("/api/dispatch/plan").json()
+        assert plan["unassigned_order_ids"] == [heavy["id"], oversize["id"]]
+        assert [item["order_id"] for item in plan["assignments"]] == [light["id"]]
+
+        capacity_reason = plan["unassigned_reasons"][str(heavy["id"])]
+        license_reason = plan["unassigned_reasons"][str(oversize["id"])]
+        assert "no available vehicle" in capacity_reason and "50000" in capacity_reason
+        assert "OVERSIZE" in license_reason and "license" in license_reason
+
+        # Preview and commit share the same capability judgment; reasons persist.
+        result = client.post("/api/dispatch/commit")
+        assert result.status_code == 200
+        body = result.json()
+        assert body["unassigned_order_ids"] == [heavy["id"], oversize["id"]]
+        assert body["unassigned_reasons"] == {
+            str(heavy["id"]): capacity_reason,
+            str(oversize["id"]): license_reason,
+        }
+        detail = client.get(f"/api/dispatch/batches/{body['batch_id']}").json()
+        assert detail["unassigned_reasons"] == body["unassigned_reasons"]
+
+
+def test_license_mismatch_409_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROUTEWEAVER_DB", _db_file(tmp_path))
+    with TestClient(app) as client:
+        order = _create_order_with_license(client, "RW-NOLIC-001", 100, "OVERSIZE")
+        response = client.post("/api/dispatch/commit")
+        assert response.status_code == 409
+
+        # Capability mismatch with zero assignments creates no batch, changes nothing.
+        assert client.get("/api/dispatch/batches").json() == []
+        assert client.get("/api/orders").json()[0]["status"] == "pending"
+        assert all(
+            vehicle["status"] == "available"
+            for vehicle in client.get("/api/vehicles").json()
+            if vehicle["code"] in ("VAN-01", "TRUCK-07")
+        )
+
+
+def test_unassigned_reasons_survive_restart(tmp_path, monkeypatch):
+    db_file = _db_file(tmp_path)
+    monkeypatch.setenv("ROUTEWEAVER_DB", db_file)
+    with TestClient(app) as client:
+        heavy = _create_order(client, "RW-RESTART-R-001", 50_000, due_hours=1)
+        oversize = _create_order_with_license(
+            client, "RW-RESTART-R-002", 100, "OVERSIZE", due_hours=2
+        )
+        light = _create_order(client, "RW-RESTART-R-003", 100, due_hours=3)
+        committed = client.post("/api/dispatch/commit").json()
+        assert committed["unassigned_order_ids"] == [heavy["id"], oversize["id"]]
+
+    with TestClient(app) as client:
+        detail = client.get("/api/dispatch/batches/1").json()
+        assert detail == committed
+        assert set(detail["unassigned_reasons"]) == {str(heavy["id"]), str(oversize["id"])}

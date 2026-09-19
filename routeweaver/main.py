@@ -16,6 +16,7 @@ from .models import (
     Order,
     OrderCreate,
     Vehicle,
+    VehicleCreate,
 )
 from .services import (
     NothingToCommitError,
@@ -60,14 +61,18 @@ def create_order(payload: OrderCreate) -> dict:
     try:
         with transaction() as connection:
             cursor = connection.execute(
-                """INSERT INTO orders(reference, origin, destination, weight_kg, due_at, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                """INSERT INTO orders(
+                       reference, origin, destination, weight_kg, due_at,
+                       required_license, status, created_at
+                   )
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
                 (
                     payload.reference,
                     payload.origin,
                     payload.destination,
                     payload.weight_kg,
                     payload.due_at.isoformat(),
+                    payload.required_license,
                     created_at,
                 ),
             )
@@ -79,10 +84,54 @@ def create_order(payload: OrderCreate) -> dict:
     return dict(row)
 
 
+def _vehicles_with_licenses(connection) -> list[dict]:
+    """Vehicles in id order, each with its driver and de-duplicated licenses."""
+    licenses: dict[int, list[str]] = {}
+    for row in connection.execute(
+        "SELECT vehicle_id, license_code FROM vehicle_licenses ORDER BY vehicle_id, position"
+    ):
+        licenses.setdefault(row["vehicle_id"], []).append(row["license_code"])
+
+    vehicles: list[dict] = []
+    for row in connection.execute("SELECT * FROM vehicles ORDER BY id"):
+        vehicle = dict(row)
+        vehicle["licenses"] = licenses.get(vehicle["id"], [])
+        vehicles.append(vehicle)
+    return vehicles
+
+
 @app.get("/api/vehicles", response_model=list[Vehicle])
 def list_vehicles() -> list[dict]:
     with connect() as connection:
-        return [dict(row) for row in connection.execute("SELECT * FROM vehicles ORDER BY id")]
+        return _vehicles_with_licenses(connection)
+
+
+@app.post("/api/vehicles", response_model=Vehicle, status_code=201)
+def create_vehicle(payload: VehicleCreate) -> dict:
+    try:
+        with transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO vehicles(code, capacity_kg, driver_name, status)
+                   VALUES (?, ?, ?, 'available')""",
+                (payload.code, payload.capacity_kg, payload.driver_name),
+            )
+            vehicle_id = cursor.lastrowid
+            connection.executemany(
+                "INSERT INTO vehicle_licenses(vehicle_id, license_code, position) VALUES (?, ?, ?)",
+                [(vehicle_id, license_code, position)
+                 for position, license_code in enumerate(payload.licenses)],
+            )
+    except Exception as error:
+        if "UNIQUE constraint failed" in str(error):
+            raise HTTPException(status_code=409, detail="vehicle code already exists") from error
+        raise
+
+    with connect() as connection:
+        return next(
+            vehicle
+            for vehicle in _vehicles_with_licenses(connection)
+            if vehicle["id"] == vehicle_id
+        )
 
 
 @app.post("/api/dispatch/plan", response_model=DispatchPlan)
